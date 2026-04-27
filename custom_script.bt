@@ -1,0 +1,96 @@
+#include <linux/tcp.h>
+#include <net/inet_sock.h>
+
+BEGIN
+{
+  printf("ts_ns,event,dir,src_ip,src_port,dst_ip,dst_port,comm,pid,ret\n");
+}
+
+/*
+ * OUTBOUND TCP connections:
+ * - kprobe stores the sock* for this thread
+ * - kretprobe prints after connect() attempt returns (fields populated)
+ */
+kprobe:tcp_v4_connect
+{
+  $sk = (struct sock *)arg0;
+
+  @sk_by_tid[tid] = $sk;
+  @tracked_sock[$sk] = pid;
+}
+
+/*
+ * Capture REAL connect() return value from syscall exit
+ */
+tracepoint:syscalls:sys_exit_connect
+{
+  @ret_by_tid[tid] = args->ret;
+}
+
+kretprobe:tcp_v4_connect
+{
+  $sk = (struct sock *)@sk_by_tid[tid];
+  if ($sk == 0) { return; }
+
+  $inet = (struct inet_sock *)$sk;
+
+  $src_ip = ntop($inet->inet_saddr);
+  $dst_ip = ntop($inet->inet_daddr);
+
+  $sport = bswap($inet->inet_sport);
+  $dport = bswap($inet->inet_dport);
+
+  $ret = @ret_by_tid[tid];
+
+  delete(@sk_by_tid[tid]);
+  delete(@ret_by_tid[tid]);
+
+  printf("%llu,OUT,%s,%d,%s,%d,%s,%d,%d\n",
+         nsecs, $src_ip, $sport, $dst_ip, $dport, comm, pid, $ret);
+}
+
+/*
+ * INBOUND accepted TCP connections (server-side accept()).
+ * Only appears if something is listening and accepting connections.
+ */
+kretprobe:inet_csk_accept
+{
+  $sk = (struct sock *)retval;
+  if ($sk == 0) { return; }
+
+  $inet = (struct inet_sock *)$sk;
+
+  // For accepted sockets, local is inet_saddr/inet_sport, peer is inet_daddr/inet_dport
+  $peer_ip  = ntop($inet->inet_daddr);
+  $local_ip = ntop($inet->inet_saddr);
+
+  $peer_port  = bswap($inet->inet_dport);
+  $local_port = bswap($inet->inet_sport);
+
+  printf("%llu,IN,%s,%d,%s,%d,%s,%d,0\n",
+         nsecs, $peer_ip, $peer_port, $local_ip, $local_port, comm, pid);
+}
+
+kprobe:tcp_set_state
+/ arg1 == TCP_ESTABLISHED && @tracked_sock[(struct sock *)arg0] /
+{
+  delete(@tracked_sock[(struct sock *)arg0]);
+}
+
+kprobe:tcp_set_state
+/ arg1 == TCP_CLOSE && @tracked_sock[(struct sock *)arg0] /
+{
+  $sk = (struct sock *)arg0;
+  $orig_pid = @tracked_sock[$sk];
+
+  printf("%llu,FAIL_STATE,%d\n",
+         nsecs, $orig_pid);
+
+  delete(@tracked_sock[$sk]);
+}
+
+tracepoint:syscalls:sys_enter_execve
+{
+  printf("%llu,EXEC,%s,%d,%s\n",
+         nsecs, str(args->filename), pid, comm);
+}
